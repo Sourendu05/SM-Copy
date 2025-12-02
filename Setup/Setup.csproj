@@ -4,31 +4,34 @@
     <OutputType>WinExe</OutputType>
     <TargetFramework>net8.0-windows</TargetFramework>
     <UseWindowsForms>true</UseWindowsForms>
-    <ApplicationManifest>app.manifest</ApplicationManifest>
     <Nullable>enable</Nullable>
     <ImplicitUsings>disable</ImplicitUsings>
     
     <!-- Assembly info -->
-    <AssemblyName>SMCopy</AssemblyName>
-    <Product>SM Copy</Product>
-    <Description>Fast file copy tool for Windows using Robocopy</Description>
-    <Company>SM Copy</Company>
-    <Copyright>2024</Copyright>
+    <AssemblyName>SMCopySetup</AssemblyName>
+    <Product>SM Copy Setup</Product>
+    <Description>SM Copy Installer</Description>
     <Version>1.0.0</Version>
     
-    <!-- For single-file publishing -->
+    <!-- Self-contained single file -->
     <PublishSingleFile>true</PublishSingleFile>
     <SelfContained>true</SelfContained>
     <RuntimeIdentifier>win-x64</RuntimeIdentifier>
     <IncludeNativeLibrariesForSelfExtract>true</IncludeNativeLibrariesForSelfExtract>
     <EnableCompressionInSingleFile>true</EnableCompressionInSingleFile>
     
-    <!-- Trim to reduce size -->
-    <PublishTrimmed>false</PublishTrimmed>
+    <!-- Application manifest for admin elevation -->
+    <ApplicationManifest>app.manifest</ApplicationManifest>
   </PropertyGroup>
+
+  <!-- Embed SMCopy.exe as a resource after it's published -->
+  <ItemGroup>
+    <EmbeddedResource Include="..\SMCopy\bin\Publish\SMCopy.exe" Link="Resources\SMCopy.exe" Condition="Exists('..\SMCopy\bin\Publish\SMCopy.exe')" />
+  </ItemGroup>
 
   <ItemGroup>
     <PackageReference Include="Newtonsoft.Json" Version="13.0.3" />
   </ItemGroup>
 
 </Project>
+

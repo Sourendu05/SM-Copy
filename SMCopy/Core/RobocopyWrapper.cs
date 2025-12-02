@@ -4,7 +4,6 @@ using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Text;
-using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
 
@@ -27,47 +26,33 @@ namespace SMCopy.Core
     public class RobocopyWrapper
     {
         private Process? _process;
-        private readonly CancellationTokenSource _cancellationTokenSource = new();
         private DateTime _startTime;
-        private long _lastCopiedBytes = 0;
-        private DateTime _lastUpdateTime;
-        
-        // For smoothing speed calculation
+        private System.Timers.Timer? _progressTimer;
+        private string _destinationPath = "";
+        private long _totalSize = 0;
+        private long _lastBytes = 0;
+        private DateTime _lastSpeedTime;
         private readonly Queue<double> _speedSamples = new();
-        private const int MaxSpeedSamples = 5;
 
         public event EventHandler<RobocopyProgress>? ProgressChanged;
         public event EventHandler<string>? OutputReceived;
 
-        /// <summary>
-        /// Copies files or a folder using Robocopy.
-        /// </summary>
-        /// <param name="sourcePath">Source directory path (for files) or source folder path (for folder copy)</param>
-        /// <param name="destinationPath">Destination directory path</param>
-        /// <param name="fileNames">List of filenames to copy. If null/empty, assumes sourcePath is a folder to be copied recursively.</param>
-        /// <param name="totalSize">Total size of bytes to be copied (for progress calculation)</param>
-        /// <param name="cancellationToken">Cancellation token</param>
         public async Task<bool> CopyAsync(string sourcePath, string destinationPath, List<string>? fileNames, long totalSize, CancellationToken cancellationToken = default)
         {
             _startTime = DateTime.Now;
-            _lastUpdateTime = DateTime.Now;
+            _lastSpeedTime = DateTime.Now;
+            _lastBytes = 0;
             _speedSamples.Clear();
+            _destinationPath = destinationPath;
+            _totalSize = totalSize;
 
-            var progress = new RobocopyProgress
-            {
-                TotalBytes = totalSize
-            };
+            var progress = new RobocopyProgress { TotalBytes = totalSize };
 
             try
             {
                 string arguments = BuildRobocopyArguments(sourcePath, destinationPath, fileNames);
-                
-                // Log the command for debugging
-                OutputReceived?.Invoke(this, $"Command: robocopy.exe {arguments}");
-                OutputReceived?.Invoke(this, $"Source: {sourcePath}");
-                OutputReceived?.Invoke(this, $"Destination: {destinationPath}");
-                OutputReceived?.Invoke(this, "---");
-                
+                OutputReceived?.Invoke(this, $"[Robocopy] {arguments}");
+
                 var processStartInfo = new ProcessStartInfo
                 {
                     FileName = "robocopy.exe",
@@ -83,23 +68,12 @@ namespace SMCopy.Core
 
                 _process = new Process { StartInfo = processStartInfo };
 
-                _process.OutputDataReceived += (sender, e) =>
-                {
-                    if (!string.IsNullOrEmpty(e.Data))
-                    {
-                        // Robocopy with progress outputs carriage returns to update the same line.
-                        // We need to handle that if we want clean logs, but for parsing we just need the data.
-                        OutputReceived?.Invoke(this, e.Data);
-                        ParseRobocopyOutput(e.Data, progress);
-                    }
-                };
-
                 _process.ErrorDataReceived += (sender, e) =>
                 {
                     if (!string.IsNullOrEmpty(e.Data))
                     {
                         progress.ErrorMessage = e.Data;
-                        OutputReceived?.Invoke(this, $"ERROR: {e.Data}");
+                        OutputReceived?.Invoke(this, $"[Error] {e.Data}");
                     }
                 };
 
@@ -107,51 +81,51 @@ namespace SMCopy.Core
                 _process.BeginOutputReadLine();
                 _process.BeginErrorReadLine();
 
+                // Set high priority for better performance
+                try { _process.PriorityClass = ProcessPriorityClass.AboveNormal; } catch { }
+
+                // Start progress monitoring timer - polls destination size every 200ms
+                StartProgressMonitor(progress, fileNames);
+
                 // Monitor for cancellation
                 using var registration = cancellationToken.Register(() =>
                 {
                     try
                     {
+                        StopProgressMonitor();
                         if (_process != null && !_process.HasExited)
-                        {
-                            _process.Kill();
-                        }
+                            _process.Kill(true);
                     }
                     catch { }
                 });
 
                 await _process.WaitForExitAsync(cancellationToken);
+                StopProgressMonitor();
 
-                // Mark progress as completed and normalize final metrics
+                // Final update
+                var elapsed = DateTime.Now - _startTime;
+                double finalSpeed = elapsed.TotalSeconds > 0 ? totalSize / elapsed.TotalSeconds : 0;
+
                 progress.IsCompleted = true;
                 progress.ProgressPercentage = 100;
+                progress.CopiedBytes = totalSize;
                 progress.EstimatedTimeRemaining = TimeSpan.Zero;
-                progress.SpeedBytesPerSecond = 0;
+                progress.SpeedBytesPerSecond = finalSpeed;
                 ProgressChanged?.Invoke(this, progress);
 
-                // Log exit code - but only if it's a serious failure (>= 16)
-                // Exit codes 8-15 will be handled by fallback, so don't confuse users with error messages
-                if (_process.ExitCode >= 16)
-                {
-                    string exitCodeMessage = GetExitCodeMessage(_process.ExitCode);
-                    // Suppress automatic logging of fatal errors to avoid confusion when fallback succeeds
-                    // OutputReceived?.Invoke(this, "---");
-                    // OutputReceived?.Invoke(this, $"Robocopy Exit Code: {_process.ExitCode} - {exitCodeMessage}");
-                    progress.ErrorMessage = $"Copy failed: {exitCodeMessage}";
-                }
-                
-                // Return success for exit codes < 8 (robocopy considers 0-7 as success)
                 return _process.ExitCode < 8;
             }
             catch (OperationCanceledException)
             {
-                progress.ErrorMessage = "Operation cancelled by user";
+                StopProgressMonitor();
+                progress.ErrorMessage = "Operation cancelled";
                 progress.IsCompleted = true;
                 ProgressChanged?.Invoke(this, progress);
                 return false;
             }
             catch (Exception ex)
             {
+                StopProgressMonitor();
                 progress.ErrorMessage = ex.Message;
                 progress.IsCompleted = true;
                 ProgressChanged?.Invoke(this, progress);
@@ -159,240 +133,165 @@ namespace SMCopy.Core
             }
         }
 
+        private void StartProgressMonitor(RobocopyProgress progress, List<string>? fileNames)
+        {
+            _progressTimer = new System.Timers.Timer(200); // Update every 200ms
+            _progressTimer.Elapsed += (s, e) =>
+            {
+                try
+                {
+                    // Get current size of destination
+                    long currentBytes = GetDestinationSize(fileNames);
+                    
+                    if (currentBytes > 0)
+                    {
+                        progress.CopiedBytes = currentBytes;
+                        
+                        if (_totalSize > 0)
+                        {
+                            progress.ProgressPercentage = Math.Min(99.9, (currentBytes * 100.0) / _totalSize);
+                        }
+
+                        // Calculate speed
+                        var now = DateTime.Now;
+                        var elapsed = now - _lastSpeedTime;
+                        if (elapsed.TotalMilliseconds >= 500)
+                        {
+                            long bytesDelta = currentBytes - _lastBytes;
+                            if (bytesDelta > 0)
+                            {
+                                double speed = bytesDelta / elapsed.TotalSeconds;
+                                _speedSamples.Enqueue(speed);
+                                while (_speedSamples.Count > 5) _speedSamples.Dequeue();
+                                progress.SpeedBytesPerSecond = _speedSamples.Average();
+
+                                // Calculate ETA
+                                if (progress.SpeedBytesPerSecond > 0 && _totalSize > currentBytes)
+                                {
+                                    double remainingSecs = (_totalSize - currentBytes) / progress.SpeedBytesPerSecond;
+                                    progress.EstimatedTimeRemaining = TimeSpan.FromSeconds(Math.Min(remainingSecs, 86400));
+                                }
+                            }
+                            _lastBytes = currentBytes;
+                            _lastSpeedTime = now;
+                        }
+
+                        ProgressChanged?.Invoke(this, progress);
+                    }
+                }
+                catch { }
+            };
+            _progressTimer.Start();
+        }
+
+        private void StopProgressMonitor()
+        {
+            _progressTimer?.Stop();
+            _progressTimer?.Dispose();
+            _progressTimer = null;
+        }
+
+        private long GetDestinationSize(List<string>? fileNames)
+        {
+            try
+            {
+                if (fileNames != null && fileNames.Count > 0)
+                {
+                    // Single files - check each file size
+                    long total = 0;
+                    foreach (var fileName in fileNames)
+                    {
+                        var destFile = Path.Combine(_destinationPath, fileName);
+                        if (File.Exists(destFile))
+                        {
+                            total += new FileInfo(destFile).Length;
+                        }
+                    }
+                    return total;
+                }
+                else
+                {
+                    // Directory copy - get total size of destination
+                    if (Directory.Exists(_destinationPath))
+                    {
+                        return GetDirectorySize(_destinationPath);
+                    }
+                }
+            }
+            catch { }
+            return 0;
+        }
+
+        private long GetDirectorySize(string path)
+        {
+            long size = 0;
+            try
+            {
+                foreach (var file in Directory.EnumerateFiles(path, "*", SearchOption.AllDirectories))
+                {
+                    try { size += new FileInfo(file).Length; } catch { }
+                }
+            }
+            catch { }
+            return size;
+        }
+
         private string BuildRobocopyArguments(string sourcePath, string destinationPath, List<string>? fileNames)
         {
-            // Common options:
-            // /MT:128 = multi-threaded copy with 128 threads
-            // /R:0 = retry 0 times (fail fast) - User requested /R:0 /W:0
-            // /W:0 = wait 0 seconds between retries
-            // /J = unbuffered I/O (good for large files)
-            // /ZB = restartable mode; if access denied use Backup mode (Fixes Issue 4)
-            // /DCOPY:DAT = copy directory data, attributes, and timestamps
-            // /COPY:DAT = copy file data, attributes, and timestamps
-            // /XD ... = Exclude system directories
-            
-            // NOTE: Removed /NP (No Progress) to allow progress parsing (Fixes Issue 2)
-            
             var sb = new StringBuilder();
 
-            // Source and Destination
-            // IMPORTANT: Handle trailing backslashes by escaping them.
-            // If a path ends with \, and is followed by ", the \ escapes the ".
-            // So "C:\" becomes "C:\" which escapes the quote. We need "C:\\"
-            
-            string cleanSource = sourcePath.TrimEnd('\\');
-            string cleanDest = destinationPath.TrimEnd('\\');
+            string cleanSource = sourcePath.TrimEnd('\\', '/');
+            string cleanDest = destinationPath.TrimEnd('\\', '/');
 
             sb.Append($"\"{cleanSource}\" \"{cleanDest}\" ");
 
-            // Files (if specified)
-            if (fileNames != null && fileNames.Any())
+            if (fileNames != null && fileNames.Count > 0)
             {
                 foreach (var file in fileNames)
-                {
                     sb.Append($"\"{file}\" ");
-                }
             }
             else
             {
-                // Folder copy mode
-                sb.Append("/E "); // Copy subdirectories, including empty ones
+                sb.Append("/E ");  // Copy subdirectories including empty
             }
 
-            // Options
-            // /MT:64 = 64 threads (128 can cause overhead, 64 is sweet spot)
-            // Removed /J (unbuffered I/O) - it can actually slow down on some systems
-            // /ZB = Backup mode fallback
-            // /DCOPY:DAT = Copy all directory metadata
-            sb.Append("/MT:64 /R:0 /W:0 /ZB /DCOPY:DAT /COPY:DAT ");
+            // MAXIMUM SPEED PARAMETERS:
+            // /MT:16    - 16 threads (good balance of speed and overhead)
+            // /R:0 /W:0 - No retries (fail fast)
+            // /NP       - No progress output (we track via file size)
+            // /NFL /NDL - No file/dir listing (reduces output overhead)  
+            // /NC /NS   - No class/size in output
+            // /NJH /NJS - No job header/summary
+            // /COPY:D   - Copy data only (fastest, skip attributes)
+            //
+            // NOT using /J (unbuffered) - slower on SSDs with cache
+            // NOT using /NOOFFLOAD - want hardware acceleration
             
-            // Exclusions (Fixes Issue 4 - Access Denied on system folders)
-            sb.Append("/XD \"System Volume Information\" \"$RECYCLE.BIN\" \"Pagefile.sys\" \"Swapfile.sys\" \"Hiberfil.sys\" \"Config.Msi\" ");
+            sb.Append("/MT:16 ");           // 16 parallel threads
+            sb.Append("/R:0 /W:0 ");        // No retries
+            sb.Append("/NP ");              // No progress (we poll file size instead)
+            sb.Append("/NFL /NDL ");        // No file/dir listing
+            sb.Append("/NC /NS ");          // No class/size
+            sb.Append("/NJH /NJS ");        // No header/summary
+            sb.Append("/COPY:D ");          // Data only (fastest)
+
+            // Exclusions
+            sb.Append("/XD \"System Volume Information\" \"$RECYCLE.BIN\" ");
+            sb.Append("/XF pagefile.sys swapfile.sys hiberfil.sys ");
+            sb.Append("/XA:SH ");
 
             return sb.ToString();
         }
 
-        private void ParseRobocopyOutput(string output, RobocopyProgress progress)
-        {
-            try
-            {
-                // Robocopy output parsing strategy:
-                // 1. Track completed files to estimate progress
-                // 2. Parse "New File" lines to detect file starts and get sizes
-                // 3. Update lastUpdateTime to show activity
-                // 4. Calculate speed based on elapsed time and total bytes assumption
-                
-                _lastUpdateTime = DateTime.Now;
-
-                // Pattern 1: Detect file completion - lines with "100%" or "100.0%"
-                var percent100Match = Regex.Match(output, @"^\s*100(?:\.0)?%");
-                if (percent100Match.Success)
-                {
-                    progress.FilesProcessed++;
-                    
-                    // If we know total files, we can estimate overall progress
-                    if (progress.TotalFiles > 0)
-                    {
-                        progress.ProgressPercentage = (progress.FilesProcessed * 100.0) / progress.TotalFiles;
-                    }
-                }
-
-                // Pattern 2: "New File" line to detect file start and parse size
-                // Format: "  New File  \t\t   1234567\tfilename.ext"
-                // or "             New File             1.2 m   filename.ext"
-                if (output.Contains("New File"))
-                {
-                    // Try to parse filename from the line
-                    var parts = output.Split(new[] { '\t', ' ' }, StringSplitOptions.RemoveEmptyEntries);
-                    if (parts.Length > 2)
-                    {
-                        progress.CurrentFile = parts[parts.Length - 1];
-                    }
-                    
-                    // Parse file size if present (format: 1.2k, 1.5m, 1.2g, or plain bytes)
-                    var sizeMatch = Regex.Match(output, @"(\d+(?:\.\d+)?)\s*([kmg])?", RegexOptions.IgnoreCase);
-                    if (sizeMatch.Success)
-                    {
-                        double size = double.Parse(sizeMatch.Groups[1].Value);
-                        string unit = sizeMatch.Groups[2].Value.ToLower();
-                        
-                        long bytes = unit switch
-                        {
-                            "k" => (long)(size * 1024),
-                            "m" => (long)(size * 1024 * 1024),
-                            "g" => (long)(size * 1024 * 1024 * 1024),
-                            _ => (long)size
-                        };
-                        
-                        // Track as current file size (for future enhancement)
-                    }
-                }
-
-                // Pattern 3: Parse summary statistics "Files : 123" at end
-                var filesMatch = Regex.Match(output, @"Files\s*:\s*(\d+)");
-                if (filesMatch.Success)
-                {
-                    int totalFiles = int.Parse(filesMatch.Groups[1].Value);
-                    if (progress.TotalFiles == 0)
-                    {
-                        progress.TotalFiles = totalFiles;
-                    }
-                }
-
-                // Pattern 4: Parse bytes summary "Bytes : 1234567890" at end
-                var bytesMatch = Regex.Match(output, @"Bytes\s*:\s*([\d,\.]+\s*[kmg]?)", RegexOptions.IgnoreCase);
-                if (bytesMatch.Success)
-                {
-                    string bytesStr = bytesMatch.Groups[1].Value.Replace(",", "").Replace(".", "").Trim();
-                    
-                    // Handle k/m/g suffix
-                    var sizeMatch = Regex.Match(bytesStr, @"(\d+)\s*([kmg])?", RegexOptions.IgnoreCase);
-                    if (sizeMatch.Success)
-                    {
-                        long bytes = long.Parse(sizeMatch.Groups[1].Value);
-                        string unit = sizeMatch.Groups[2].Value.ToLower();
-                        
-                        bytes = unit switch
-                        {
-                            "k" => bytes * 1024,
-                            "m" => bytes * 1024 * 1024,
-                            "g" => bytes * 1024 * 1024 * 1024,
-                            _ => bytes
-                        };
-                        
-                        if (bytes > progress.CopiedBytes)
-                        {
-                            progress.CopiedBytes = bytes;
-                        }
-                    }
-                }
-
-                // Calculate speed and ETA based on elapsed time
-                var elapsed = DateTime.Now - _startTime;
-                if (elapsed.TotalSeconds > 0)
-                {
-                    // Estimate progress: assume linear progress over time
-                    if (progress.TotalBytes > 0)
-                    {
-                        // If we have total bytes, calculate bytes copied based on files processed
-                        if (progress.TotalFiles > 0 && progress.FilesProcessed > 0)
-                        {
-                            // Estimate: assume equal file sizes (imperfect but better than nothing)
-                            long estimatedCopied = (long)((progress.FilesProcessed * 1.0 / progress.TotalFiles) * progress.TotalBytes);
-                            progress.CopiedBytes = Math.Max(progress.CopiedBytes, estimatedCopied);
-                        }
-                        
-                        // Calculate speed
-                        progress.SpeedBytesPerSecond = progress.CopiedBytes / elapsed.TotalSeconds;
-                        
-                        // Add to speed samples for smoothing
-                        _speedSamples.Enqueue(progress.SpeedBytesPerSecond);
-                        if (_speedSamples.Count > MaxSpeedSamples)
-                        {
-                            _speedSamples.Dequeue();
-                        }
-                        
-                        // Use average speed
-                        if (_speedSamples.Count > 0)
-                        {
-                            progress.SpeedBytesPerSecond = _speedSamples.Average();
-                        }
-                        
-                        // Calculate ETA
-                        if (progress.SpeedBytesPerSecond > 0)
-                        {
-                            long remainingBytes = progress.TotalBytes - progress.CopiedBytes;
-                            double remainingSeconds = remainingBytes / progress.SpeedBytesPerSecond;
-                            progress.EstimatedTimeRemaining = TimeSpan.FromSeconds(Math.Max(0, remainingSeconds));
-                        }
-                        
-                        // Update progress percentage
-                        if (progress.CopiedBytes > 0)
-                        {
-                            progress.ProgressPercentage = Math.Min(100, (progress.CopiedBytes * 100.0) / progress.TotalBytes);
-                        }
-                    }
-                }
-
-                // Notify progress update
-                ProgressChanged?.Invoke(this, progress);
-            }
-            catch
-            {
-                // Ignore parsing errors to prevent crashes
-            }
-        }
-
         public void Cancel()
         {
-            _cancellationTokenSource.Cancel();
+            StopProgressMonitor();
             try
             {
                 if (_process != null && !_process.HasExited)
-                {
-                    _process.Kill();
-                }
+                    _process.Kill(true);
             }
             catch { }
         }
-
-        private string GetExitCodeMessage(int exitCode)
-        {
-            return exitCode switch
-            {
-                0 => "No files copied (no changes detected)",
-                1 => "Files copied successfully",
-                2 => "Extra files or directories detected",
-                3 => "Files copied and extra files detected",
-                4 => "Some mismatched files or directories detected",
-                5 => "Some files copied, some mismatched",
-                6 => "Extra files and mismatched files exist",
-                7 => "Files copied, mismatches and extras exist",
-                8 => "Copy errors - some files/directories could not be copied",
-                16 => "Fatal error - robocopy did not copy any files",
-                _ => $"Unknown exit code: {exitCode}"
-            };
-        }
     }
 }
-

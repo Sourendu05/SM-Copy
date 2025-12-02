@@ -15,24 +15,25 @@ namespace SMCopy.Forms
     {
         private readonly List<CopyItem> _items;
         private readonly string _destination;
-        private CancellationTokenSource _cancellationTokenSource = new();
+        private CancellationTokenSource _cts = new();
         private DateTime _startTime;
         private long _totalBytes = 0;
         private long _copiedBytes = 0;
-        private int _currentItemIndex = 0;
-        private int _successfulItems = 0;
-        private int _failedItems = 0;
+        private int _successCount = 0;
+        private int _failCount = 0;
+        private bool _isCompleted = false;
+        private FileCopier? _copier;
 
-        // UI Controls
+        // UI
         private ProgressBar progressBar = null!;
         private Label lblStatus = null!;
-        private Label lblCurrentFile = null!;
+        private Label lblFile = null!;
         private Label lblSpeed = null!;
-        private Label lblTimeRemaining = null!;
+        private Label lblTime = null!;
         private Label lblSize = null!;
-        private Button btnPause = null!;
         private Button btnCancel = null!;
         private TextBox txtLog = null!;
+        private CheckBox chkLog = null!;
 
         public ProgressWindow(List<CopyItem> items, string destination)
         {
@@ -42,527 +43,310 @@ namespace SMCopy.Forms
 
             InitializeComponent();
             InitializeUI();
-            
-            // Start copying when form loads
-            this.Load += async (s, e) => await StartCopyingAsync();
+            this.Load += async (s, e) => await StartCopyAsync();
         }
 
         private void InitializeComponent()
         {
-            this.Text = "SM Copy - Copying Files";
-            this.Size = new Size(600, 450);
-            this.FormBorderStyle = FormBorderStyle.FixedDialog;
-            this.MaximizeBox = false;
-            this.StartPosition = FormStartPosition.CenterScreen;
-            this.FormClosing += ProgressWindow_FormClosing;
+            Text = "SM Copy - Fast File Transfer";
+            Size = new Size(550, 320);
+            FormBorderStyle = FormBorderStyle.FixedDialog;
+            MaximizeBox = false;
+            StartPosition = FormStartPosition.CenterScreen;
+            FormClosing += OnFormClosing;
+            BackColor = Color.FromArgb(30, 30, 30);
+            ForeColor = Color.White;
         }
 
         private void InitializeUI()
         {
-            int padding = 15;
-            int currentY = padding;
+            int p = 20, y = p;
 
-            // Status Label
             lblStatus = new Label
             {
-                Text = "Preparing to copy...",
-                Location = new Point(padding, currentY),
-                Size = new Size(this.ClientSize.Width - padding * 2, 25),
-                Font = new Font("Segoe UI", 10, FontStyle.Bold)
+                Text = "Starting...",
+                Location = new Point(p, y),
+                Size = new Size(ClientSize.Width - p * 2, 28),
+                Font = new Font("Segoe UI", 12, FontStyle.Bold),
+                ForeColor = Color.FromArgb(100, 200, 255)
             };
-            this.Controls.Add(lblStatus);
-            currentY += 35;
+            Controls.Add(lblStatus);
+            y += 35;
 
-            // Progress Bar
             progressBar = new ProgressBar
             {
-                Location = new Point(padding, currentY),
-                Size = new Size(this.ClientSize.Width - padding * 2, 30),
+                Location = new Point(p, y),
+                Size = new Size(ClientSize.Width - p * 2, 25),
                 Style = ProgressBarStyle.Continuous
             };
-            this.Controls.Add(progressBar);
-            currentY += 40;
+            Controls.Add(progressBar);
+            y += 35;
 
-            // Current File Label
-            lblCurrentFile = new Label
+            lblFile = new Label
             {
-                Text = "Current file: None",
-                Location = new Point(padding, currentY),
-                Size = new Size(this.ClientSize.Width - padding * 2, 20),
-                Font = new Font("Segoe UI", 9)
+                Text = "",
+                Location = new Point(p, y),
+                Size = new Size(ClientSize.Width - p * 2, 22),
+                Font = new Font("Segoe UI", 9),
+                ForeColor = Color.LightGray
             };
-            this.Controls.Add(lblCurrentFile);
-            currentY += 25;
+            Controls.Add(lblFile);
+            y += 28;
 
-            // Speed Label
             lblSpeed = new Label
             {
-                Text = "Speed: 0 MB/s",
-                Location = new Point(padding, currentY),
-                Size = new Size(250, 20),
-                Font = new Font("Segoe UI", 9)
+                Text = "Speed: --",
+                Location = new Point(p, y),
+                Size = new Size(200, 22),
+                Font = new Font("Segoe UI", 9, FontStyle.Bold),
+                ForeColor = Color.LightGreen
             };
-            this.Controls.Add(lblSpeed);
+            Controls.Add(lblSpeed);
 
-            // Time Remaining Label
-            lblTimeRemaining = new Label
+            lblTime = new Label
             {
-                Text = "Time remaining: Calculating...",
-                Location = new Point(padding + 250, currentY),
-                Size = new Size(this.ClientSize.Width - padding * 2 - 250, 20),
-                Font = new Font("Segoe UI", 9)
+                Text = "Time: --",
+                Location = new Point(p + 200, y),
+                Size = new Size(ClientSize.Width - p * 2 - 200, 22),
+                Font = new Font("Segoe UI", 9),
+                ForeColor = Color.LightGray
             };
-            this.Controls.Add(lblTimeRemaining);
-            currentY += 25;
+            Controls.Add(lblTime);
+            y += 28;
 
-            // Size Label
             lblSize = new Label
             {
-                Text = $"Total: {CopyManager.FormatBytes(_totalBytes)}",
-                Location = new Point(padding, currentY),
-                Size = new Size(this.ClientSize.Width - padding * 2, 20),
+                Text = $"0 B / {CopyManager.FormatBytes(_totalBytes)}",
+                Location = new Point(p, y),
+                Size = new Size(ClientSize.Width - p * 2, 22),
+                Font = new Font("Segoe UI", 9),
+                ForeColor = Color.Gray
+            };
+            Controls.Add(lblSize);
+            y += 35;
+
+            chkLog = new CheckBox
+            {
+                Text = "Show Details",
+                Location = new Point(p, y),
+                Size = new Size(120, 25),
+                ForeColor = Color.Gray,
                 Font = new Font("Segoe UI", 9)
             };
-            this.Controls.Add(lblSize);
-            currentY += 30;
-
-            // Log TextBox
-            txtLog = new TextBox
+            chkLog.CheckedChanged += (s, e) =>
             {
-                Location = new Point(padding, currentY),
-                Size = new Size(this.ClientSize.Width - padding * 2, 150),
-                Multiline = true,
-                ScrollBars = ScrollBars.Vertical,
-                ReadOnly = true,
-                Font = new Font("Consolas", 8)
+                txtLog.Visible = chkLog.Checked;
+                Height = chkLog.Checked ? 480 : 320;
             };
-            this.Controls.Add(txtLog);
-            currentY += 160;
+            Controls.Add(chkLog);
 
-            // Buttons
             btnCancel = new Button
             {
                 Text = "Cancel",
-                Location = new Point(this.ClientSize.Width - padding - 80, currentY),
-                Size = new Size(80, 30)
+                Location = new Point(ClientSize.Width - p - 90, y - 3),
+                Size = new Size(90, 32),
+                Font = new Font("Segoe UI", 9),
+                BackColor = Color.FromArgb(60, 60, 60),
+                ForeColor = Color.White,
+                FlatStyle = FlatStyle.Flat
             };
-            btnCancel.Click += BtnCancel_Click;
-            this.Controls.Add(btnCancel);
+            btnCancel.FlatAppearance.BorderColor = Color.Gray;
+            btnCancel.Click += OnCancelClick;
+            Controls.Add(btnCancel);
+            y += 40;
 
-            btnPause = new Button
+            txtLog = new TextBox
             {
-                Text = "Pause",
-                Location = new Point(this.ClientSize.Width - padding - 170, currentY),
-                Size = new Size(80, 30),
-                Enabled = false // Pause not implemented in this version
+                Location = new Point(p, y),
+                Size = new Size(ClientSize.Width - p * 2, 150),
+                Multiline = true,
+                ScrollBars = ScrollBars.Vertical,
+                ReadOnly = true,
+                Font = new Font("Consolas", 8),
+                BackColor = Color.FromArgb(20, 20, 20),
+                ForeColor = Color.LightGreen,
+                Visible = false
             };
-            this.Controls.Add(btnPause);
+            Controls.Add(txtLog);
         }
 
-        private async Task StartCopyingAsync()
+        private async Task StartCopyAsync()
         {
             _startTime = DateTime.Now;
-            AddLog($"Starting copy operation: {_items.Count} item(s)");
-            AddLog($"Destination: {_destination}");
-            AddLog("---");
+            Log($"SM Copy - {_items.Count} item(s) to {_destination}");
 
             try
             {
-                // Separate files and folders
                 var files = _items.Where(i => i.Type == "file").ToList();
                 var folders = _items.Where(i => i.Type == "folder").ToList();
 
-                int totalOperations = folders.Count;
-                
-                // Group files by source directory to batch them
-                var fileGroups = files.GroupBy(f => Path.GetDirectoryName(f.Path)).ToList();
-                totalOperations += fileGroups.Count;
-
-                int currentOpIndex = 0;
-
-                // 1. Copy Folders (one by one as Robocopy handles recursion efficiently)
+                // Copy folders
                 foreach (var folder in folders)
                 {
-                    if (_cancellationTokenSource.Token.IsCancellationRequested) break;
-
-                    currentOpIndex++;
-                    _currentItemIndex = currentOpIndex; // Approximate for UI
-                    
-                    await CopyFolderAsync(folder, currentOpIndex, totalOperations);
+                    if (_cts.Token.IsCancellationRequested) break;
+                    await CopyFolderAsync(folder);
                 }
 
-                // 2. Copy Files (Batched by directory)
-                foreach (var group in fileGroups)
+                // Copy files (grouped by source directory)
+                var groups = files.GroupBy(f => Path.GetDirectoryName(f.Path)).ToList();
+                foreach (var group in groups)
                 {
-                    if (_cancellationTokenSource.Token.IsCancellationRequested) break;
-
-                    currentOpIndex++;
-                    string sourceDir = group.Key ?? "";
-                    var batchFiles = group.Select(i => Path.GetFileName(i.Path)).ToList();
-                    long batchSize = group.Sum(i => i.Size);
-
-                    await CopyFileBatchAsync(sourceDir, batchFiles, batchSize, currentOpIndex, totalOperations);
+                    if (_cts.Token.IsCancellationRequested) break;
+                    await CopyFilesAsync(group.Key ?? "", group.ToList());
                 }
 
-                if (!_cancellationTokenSource.Token.IsCancellationRequested)
-                {
-                    string message = $"Copy completed!\n\nSuccessful: {_successfulItems}\nFailed: {_failedItems}\nTime: {CopyManager.FormatTimeSpan(DateTime.Now - _startTime)}";
-                    MessageBoxIcon icon = _failedItems > 0 ? MessageBoxIcon.Warning : MessageBoxIcon.Information;
-                    
-                    UpdateStatus("Copy operation finished.", 100);
-                    AddLog("---");
-                    AddLog($"Summary: {_successfulItems} successful, {_failedItems} failed.");
-                    
-                    MessageBox.Show(message, "Copy Complete", MessageBoxButtons.OK, icon);
-                    
-                    this.Close();
-                }
+                if (!_cts.Token.IsCancellationRequested)
+                    ShowComplete();
             }
             catch (Exception ex)
             {
-                AddLog($"ERROR: {ex.Message}");
-                MessageBox.Show($"An error occurred:\n{ex.Message}", "Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                Log($"ERROR: {ex.Message}");
+                ShowError(ex.Message);
             }
         }
 
-        private async Task CopyFolderAsync(CopyItem item, int index, int total)
+        private async Task CopyFolderAsync(CopyItem folder)
         {
-            string folderName = Path.GetFileName(item.Path);
-            AddLog($"Copying Folder: {folderName}");
-            AddLog($"Source: {item.Path}");
+            string name = Path.GetFileName(folder.Path);
+            SetStatus($"Copying: {name}");
+            Log($"Folder: {folder.Path}");
 
-            UpdateStatus($"Copying folder {folderName}... ({index}/{total})", 0);
+            _copier = new FileCopier();
+            long startBytes = _copiedBytes;
 
-            var wrapper = new RobocopyWrapper();
-            wrapper.ProgressChanged += Wrapper_ProgressChanged;
-            wrapper.OutputReceived += (s, output) => AddLog(output);
-
-            string sourcePath = item.Path;
-            string destPath = Path.Combine(_destination, folderName);
-            
-            AddLog($"Destination: {destPath}");
-
-            // Try Robocopy first
-            bool success = await wrapper.CopyAsync(
-                sourcePath,
-                destPath,
-                null, 
-                item.Size,
-                _cancellationTokenSource.Token
-            );
-
-            if (!success)
+            _copier.ProgressChanged += (s, p) =>
             {
-                AddLog("Using fallback copy method...");
-                try
-                {
-                    var state = new CopyProgressState 
-                    { 
-                        TotalBytes = item.Size, 
-                        StartTime = DateTime.Now 
-                    };
-                    await Task.Run(() => RecursiveCopy(sourcePath, destPath, _cancellationTokenSource.Token, state));
-                    success = true;
-                    AddLog("✓ Fallback copy successful.");
-                }
-                catch (Exception ex)
-                {
-                    AddLog($"✗ Fallback copy failed: {ex.Message}");
-                    success = false;
-                }
-            }
-            else
-            {
-                AddLog("✓ Robocopy completed successfully.");
-            }
+                _copiedBytes = startBytes + p.CopiedBytes;
+                UpdateUI(p.CurrentFile, p.SpeedBytesPerSecond, p.EstimatedTimeRemaining);
+            };
+            _copier.LogMessage += (s, msg) => Log(msg);
 
-            if (success) 
-            {
-                AddLog($"Completed folder: {folderName}");
-                _successfulItems++;
-            }
-            else 
-            {
-                AddLog($"Failed or incomplete folder: {folderName}");
-                _failedItems++;
-            }
+            string dest = Path.Combine(_destination, name);
+            bool ok = await _copier.CopyFolderAsync(folder.Path, dest, folder.Size, _cts.Token);
+
+            if (ok) _successCount++;
+            else _failCount++;
         }
 
-        private class CopyProgressState
+        private async Task CopyFilesAsync(string sourceDir, List<CopyItem> files)
         {
-            private long _copiedBytes;
-            public long TotalBytes { get; set; }
-            public DateTime StartTime { get; set; }
+            var names = files.Select(f => Path.GetFileName(f.Path)).ToList();
+            long size = files.Sum(f => f.Size);
 
-            public long CopiedBytes
-            {
-                get => Interlocked.Read(ref _copiedBytes);
-            }
+            SetStatus($"Copying {names.Count} file(s)...");
+            Log($"Files: {sourceDir} ({names.Count} files)");
 
-            public void AddCopiedBytes(long bytes)
+            _copier = new FileCopier();
+            long startBytes = _copiedBytes;
+
+            _copier.ProgressChanged += (s, p) =>
             {
-                Interlocked.Add(ref _copiedBytes, bytes);
-            }
+                _copiedBytes = startBytes + p.CopiedBytes;
+                UpdateUI(p.CurrentFile, p.SpeedBytesPerSecond, p.EstimatedTimeRemaining);
+            };
+            _copier.LogMessage += (s, msg) => Log(msg);
+
+            bool ok = await _copier.CopyFilesAsync(sourceDir, _destination, names, size, _cts.Token);
+
+            if (ok) _successCount += names.Count;
+            else _failCount += names.Count;
         }
 
-        private void RecursiveCopy(string sourceDir, string destDir, CancellationToken token, CopyProgressState state)
+        private void UpdateUI(string file, double speed, TimeSpan eta)
         {
-            Directory.CreateDirectory(destDir);
+            if (InvokeRequired) { BeginInvoke(new Action(() => UpdateUI(file, speed, eta))); return; }
 
-            var files = Directory.GetFiles(sourceDir);
-            
-            // CRITICAL: Use sequential copy, NOT parallel
-            // Parallel I/O causes disk seek thrashing and kills performance
-            // Windows Explorer copies files sequentially for a reason
-            foreach (var file in files)
-            {
-                if (token.IsCancellationRequested) return;
-                
-                string fileName = Path.GetFileName(file);
-                string destFile = Path.Combine(destDir, fileName);
-                
-                // HIGH PERFORMANCE COPY:
-                // - 8MB buffer (optimal for modern disks)
-                // - NO WriteThrough (allows OS write caching like Windows Explorer)
-                // - Asynchronous for better I/O pipeline
-                // - SequentialScan hint for read-ahead optimization
-                const int bufferSize = 8 * 1024 * 1024; // 8MB
-                
-                using (var sourceStream = new FileStream(file, FileMode.Open, FileAccess.Read, FileShare.Read, bufferSize, FileOptions.SequentialScan | FileOptions.Asynchronous))
-                using (var destStream = new FileStream(destFile, FileMode.Create, FileAccess.Write, FileShare.None, bufferSize, FileOptions.Asynchronous))
-                {
-                    byte[] buffer = new byte[bufferSize];
-                    int bytesRead;
-                    long fileProgress = 0;
-                    
-                    while ((bytesRead = sourceStream.Read(buffer, 0, buffer.Length)) > 0)
-                    {
-                        if (token.IsCancellationRequested) return;
-                        destStream.Write(buffer, 0, bytesRead);
-                        
-                        fileProgress += bytesRead;
-                        state.AddCopiedBytes(bytesRead);
-                        
-                        // Update UI less frequently (every 100MB) to reduce overhead
-                        if (state.CopiedBytes % (100 * 1024 * 1024) < bufferSize) 
-                        {
-                            UpdateProgressUI(state.TotalBytes, state.CopiedBytes, state.StartTime, fileName);
-                        }
-                    }
-                }
-                
-                // Copy file attributes after content is written
-                try
-                {
-                    File.SetAttributes(destFile, File.GetAttributes(file));
-                    File.SetCreationTime(destFile, File.GetCreationTime(file));
-                    File.SetLastWriteTime(destFile, File.GetLastWriteTime(file));
-                }
-                catch { /* Ignore attribute copy failures */ }
-            }
+            double pct = _totalBytes > 0 ? (_copiedBytes * 100.0 / _totalBytes) : 0;
+            progressBar.Value = Math.Min(100, Math.Max(0, (int)pct));
 
-            // Final UI update for this directory
-            UpdateProgressUI(state.TotalBytes, state.CopiedBytes, state.StartTime, "Processing subdirectories...");
+            if (!string.IsNullOrEmpty(file))
+                lblFile.Text = file;
 
-            foreach (var subDir in Directory.GetDirectories(sourceDir))
-            {
-                if (token.IsCancellationRequested) return;
-                string destSubDir = Path.Combine(destDir, Path.GetFileName(subDir));
-                RecursiveCopy(subDir, destSubDir, token, state);
-            }
+            if (speed > 0)
+                lblSpeed.Text = $"Speed: {CopyManager.FormatSpeed(speed)}";
+
+            if (eta.TotalSeconds > 0 && eta.TotalSeconds < 86400)
+                lblTime.Text = $"Time: ~{CopyManager.FormatTimeSpan(eta)} left";
+
+            lblSize.Text = $"{CopyManager.FormatBytes(_copiedBytes)} / {CopyManager.FormatBytes(_totalBytes)}";
         }
 
-        private void UpdateProgressUI(long totalBytes, long currentCopied, DateTime startTime, string currentFile)
+        private void SetStatus(string text)
         {
-             if (InvokeRequired)
-            {
-                // Use BeginInvoke to avoid blocking the copy threads
-                BeginInvoke(new Action(() => UpdateProgressUI(totalBytes, currentCopied, startTime, currentFile)));
-                return;
-            }
-
-            // Calculate progress, speed, and ETA
-            double progressPercent = totalBytes > 0 ? (currentCopied * 100.0 / totalBytes) : 0;
-            var elapsed = DateTime.Now - startTime;
-            double speedBytesPerSec = elapsed.TotalSeconds > 0 ? currentCopied / elapsed.TotalSeconds : 0;
-            TimeSpan eta = speedBytesPerSec > 0 ? TimeSpan.FromSeconds((totalBytes - currentCopied) / speedBytesPerSec) : TimeSpan.Zero;
-            
-            progressBar.Value = Math.Min(100, (int)progressPercent);
-            lblCurrentFile.Text = $"Current file: {currentFile}";
-            lblSpeed.Text = $"Speed: {CopyManager.FormatSpeed(speedBytesPerSec)}";
-            lblTimeRemaining.Text = eta.TotalSeconds > 0 ? $"Time remaining: {CopyManager.FormatTimeSpan(eta)}" : "Time remaining: Calculating...";
-            
-            // Update status label to correct the "100%" issue
-            lblStatus.Text = $"Copying... {(int)progressPercent}%";
+            if (InvokeRequired) { Invoke(new Action(() => SetStatus(text))); return; }
+            lblStatus.Text = text;
         }
 
-        private async Task CopyFileBatchAsync(string sourceDir, List<string> fileNames, long totalSize, int index, int total)
+        private void ShowComplete()
         {
-            AddLog($"Copying Batch from: {sourceDir}");
-            AddLog($"Files in batch: {fileNames.Count}");
+            _isCompleted = true;
+            var elapsed = DateTime.Now - _startTime;
+            double speed = elapsed.TotalSeconds > 0 ? _totalBytes / elapsed.TotalSeconds : 0;
 
-            UpdateStatus($"Copying batch of {fileNames.Count} files... ({index}/{total})", 0);
+            if (InvokeRequired) { Invoke(new Action(ShowComplete)); return; }
 
-            var wrapper = new RobocopyWrapper();
-            wrapper.ProgressChanged += Wrapper_ProgressChanged;
-            wrapper.OutputReceived += (s, output) => AddLog(output);
+            lblStatus.Text = "Transfer Complete!";
+            lblStatus.ForeColor = Color.LightGreen;
+            progressBar.Value = 100;
 
-            string destPath = _destination;
+            lblFile.Text = $"{_successCount} item(s) copied" + (_failCount > 0 ? $", {_failCount} failed" : "");
+            lblFile.ForeColor = _failCount > 0 ? Color.Orange : Color.LightGreen;
 
-            bool success = await wrapper.CopyAsync(
-                sourceDir,
-                destPath,
-                fileNames,
-                totalSize,
-                _cancellationTokenSource.Token
-            );
+            lblSpeed.Text = $"Speed: {CopyManager.FormatSpeed(speed)}";
+            lblTime.Text = $"Time: {CopyManager.FormatTimeSpan(elapsed)}";
+            lblSize.Text = $"Completed: {CopyManager.FormatBytes(_totalBytes)}";
 
-            if (!success)
-            {
-                AddLog("Robocopy batch failed. Attempting fallback copy for files...");
-                int fallbackSuccessCount = 0;
-                
-                foreach (var fileName in fileNames)
-                {
-                    if (_cancellationTokenSource.Token.IsCancellationRequested) break;
-                    try
-                    {
-                        string sourceFile = Path.Combine(sourceDir, fileName);
-                        string destFile = Path.Combine(destPath, fileName);
-                        
-                        // Ensure destination directory exists
-                        Directory.CreateDirectory(destPath);
-                        
-                        await Task.Run(() => File.Copy(sourceFile, destFile, true));
-                        fallbackSuccessCount++;
-                    }
-                    catch (Exception ex)
-                    {
-                        AddLog($"Failed to copy file {fileName}: {ex.Message}");
-                    }
-                }
+            btnCancel.Text = "Close";
+            btnCancel.BackColor = Color.FromArgb(40, 120, 80);
 
-                if (fallbackSuccessCount > 0)
-                {
-                    success = true; // Consider partial success as success for the batch operation wrapper
-                    _successfulItems += fallbackSuccessCount;
-                    _failedItems += (fileNames.Count - fallbackSuccessCount);
-                    AddLog($"Fallback copy: {fallbackSuccessCount} files copied, {fileNames.Count - fallbackSuccessCount} failed.");
-                }
-                else
-                {
-                    _failedItems += fileNames.Count;
-                }
-            }
-            else
-            {
-                _successfulItems += fileNames.Count;
-            }
-
-            if (success) AddLog($"Completed batch from: {sourceDir}");
-            else AddLog($"Failed or incomplete batch from: {sourceDir}");
+            Log($"Done: {_successCount} ok, {_failCount} failed, {CopyManager.FormatTimeSpan(elapsed)}, {CopyManager.FormatSpeed(speed)}");
         }
 
-        private void Wrapper_ProgressChanged(object? sender, RobocopyProgress e)
+        private void ShowError(string msg)
         {
-            if (InvokeRequired)
-            {
-                Invoke(new Action(() => Wrapper_ProgressChanged(sender, e)));
-                return;
-            }
+            _isCompleted = true;
+            if (InvokeRequired) { Invoke(new Action(() => ShowError(msg))); return; }
 
-            // Update progress bar
-            int progress = (int)Math.Min(100, Math.Max(0, e.ProgressPercentage));
-            progressBar.Value = progress;
-
-            // Update labels
-            if (!string.IsNullOrEmpty(e.CurrentFile))
-            {
-                lblCurrentFile.Text = $"Current file: {e.CurrentFile}";
-            }
-
-            if (e.SpeedBytesPerSecond > 0)
-            {
-                lblSpeed.Text = $"Speed: {CopyManager.FormatSpeed(e.SpeedBytesPerSecond)}";
-            }
-
-            if (e.EstimatedTimeRemaining.TotalSeconds > 0)
-            {
-                lblTimeRemaining.Text = $"Time remaining: {CopyManager.FormatTimeSpan(e.EstimatedTimeRemaining)}";
-            }
-
-            // Update copied bytes for overall progress
-            _copiedBytes += e.CopiedBytes;
-            
-            // Calculate overall progress across all items
-            int overallProgress = _totalBytes > 0 
-                ? (int)((_currentItemIndex - 1) * 100.0 / _items.Count + (e.ProgressPercentage / _items.Count))
-                : 0;
-            
-            UpdateStatus($"Copying item {_currentItemIndex}/{_items.Count}... {progress}%", overallProgress);
+            lblStatus.Text = "Error!";
+            lblStatus.ForeColor = Color.Red;
+            lblFile.Text = msg;
+            lblFile.ForeColor = Color.Red;
+            btnCancel.Text = "Close";
         }
 
-        private void UpdateStatus(string status, int progress)
+        private void Log(string msg)
         {
-            if (InvokeRequired)
-            {
-                Invoke(new Action(() => UpdateStatus(status, progress)));
-                return;
-            }
-
-            lblStatus.Text = status;
-            progressBar.Value = Math.Min(100, Math.Max(0, progress));
+            if (InvokeRequired) { BeginInvoke(new Action(() => Log(msg))); return; }
+            txtLog.AppendText($"[{DateTime.Now:HH:mm:ss}] {msg}{Environment.NewLine}");
         }
 
-        private void AddLog(string message)
+        private void OnCancelClick(object? sender, EventArgs e)
         {
-            if (InvokeRequired)
+            if (_isCompleted) { Close(); return; }
+
+            if (MessageBox.Show("Cancel?", "Confirm", MessageBoxButtons.YesNo) == DialogResult.Yes)
             {
-                Invoke(new Action(() => AddLog(message)));
-                return;
-            }
-
-            txtLog.AppendText($"[{DateTime.Now:HH:mm:ss}] {message}{Environment.NewLine}");
-        }
-
-        private void BtnCancel_Click(object? sender, EventArgs e)
-        {
-            var result = MessageBox.Show(
-                "Are you sure you want to cancel the copy operation?",
-                "Confirm Cancel",
-                MessageBoxButtons.YesNo,
-                MessageBoxIcon.Question
-            );
-
-            if (result == DialogResult.Yes)
-            {
-                _cancellationTokenSource.Cancel();
-                AddLog("Cancelling operation...");
+                _cts.Cancel();
+                _copier?.Cancel();
                 btnCancel.Enabled = false;
                 btnCancel.Text = "Cancelling...";
             }
         }
 
-        private void ProgressWindow_FormClosing(object? sender, FormClosingEventArgs e)
+        private void OnFormClosing(object? sender, FormClosingEventArgs e)
         {
-            if (progressBar.Value < 100 && progressBar.Value > 0)
-            {
-                var result = MessageBox.Show(
-                    "Copy operation is still in progress. Are you sure you want to close?",
-                    "Confirm Close",
-                    MessageBoxButtons.YesNo,
-                    MessageBoxIcon.Warning
-                );
+            if (_isCompleted) return;
 
-                if (result == DialogResult.No)
+            if (progressBar.Value > 0 && progressBar.Value < 100)
+            {
+                if (MessageBox.Show("Cancel and close?", "Confirm", MessageBoxButtons.YesNo) == DialogResult.No)
                 {
                     e.Cancel = true;
                     return;
                 }
-
-                _cancellationTokenSource.Cancel();
+                _cts.Cancel();
+                _copier?.Cancel();
             }
         }
     }
 }
-

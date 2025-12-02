@@ -1,6 +1,5 @@
 using System;
 using System.IO;
-using System.Reflection;
 using Microsoft.Win32;
 
 namespace SMCopy.Core
@@ -9,7 +8,11 @@ namespace SMCopy.Core
     {
         private static string GetExecutablePath()
         {
-            return Assembly.GetExecutingAssembly().Location.Replace(".dll", ".exe");
+            // For single-file apps, Assembly.Location returns empty string
+            // Use AppContext.BaseDirectory + exe name instead
+            string exeName = System.Diagnostics.Process.GetCurrentProcess().MainModule?.FileName 
+                ?? Path.Combine(AppContext.BaseDirectory, "SMCopy.exe");
+            return exeName;
         }
 
         public static void Register()
@@ -31,7 +34,7 @@ namespace SMCopy.Core
             // HKEY_CLASSES_ROOT\*\shell\SMCopy
             using var key = Registry.ClassesRoot.CreateSubKey(@"*\shell\SMCopy");
             key.SetValue("", "SM Copy");
-            key.SetValue("Icon", exePath);
+            key.SetValue("Icon", $"\"{exePath}\"");
 
             using var commandKey = key.CreateSubKey("command");
             commandKey.SetValue("", $"\"{exePath}\" --copy \"%1\"");
@@ -42,7 +45,7 @@ namespace SMCopy.Core
             // HKEY_CLASSES_ROOT\Directory\shell\SMCopy
             using var key = Registry.ClassesRoot.CreateSubKey(@"Directory\shell\SMCopy");
             key.SetValue("", "SM Copy");
-            key.SetValue("Icon", exePath);
+            key.SetValue("Icon", $"\"{exePath}\"");
 
             using var commandKey = key.CreateSubKey("command");
             commandKey.SetValue("", $"\"{exePath}\" --copy \"%1\"");
@@ -53,7 +56,7 @@ namespace SMCopy.Core
             // HKEY_CLASSES_ROOT\Directory\Background\shell\SMPaste
             using var key = Registry.ClassesRoot.CreateSubKey(@"Directory\Background\shell\SMPaste");
             key.SetValue("", "SM Paste");
-            key.SetValue("Icon", exePath);
+            key.SetValue("Icon", $"\"{exePath}\"");
 
             using var commandKey = key.CreateSubKey("command");
             commandKey.SetValue("", $"\"{exePath}\" --paste \"%V\"");
@@ -97,4 +100,3 @@ namespace SMCopy.Core
         }
     }
 }
-
